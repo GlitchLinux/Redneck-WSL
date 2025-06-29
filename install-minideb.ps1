@@ -231,75 +231,44 @@ function Install-MasterComponents {
             return $false
         }
         
-        # Download master.zip using wget with detailed progress
+        # Download master.zip using wget with the classic reliable command
         if (-not (Test-Path $Config.MasterZipPath)) {
             Show-Progress -Activity "Downloading Components" -Status "Downloading master.zip with wget..." -PercentComplete 0
             
-            Write-Log "Using wget for fast master.zip download with progress..."
+            Write-Log "Using classic wget command for master.zip download..."
+            Write-Log "Executing: .\wget.exe $($Config.MasterUrl)"
             
-            # Wget command with detailed progress
-            $wgetArgs = @(
-                "--progress=bar:force:noscroll",  # Detailed progress bar
-                "--show-progress",                # Show progress info
-                "--tries=3",                      # Retry 3 times
-                "--timeout=60",                   # 60s timeout per chunk
-                "--connect-timeout=30",           # 30s connection timeout
-                "--read-timeout=60",              # 60s read timeout
-                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "-O", "`"$($Config.MasterZipPath)`"",  # Output file
-                "`"$($Config.MasterUrl)`""             # URL
-            )
+            # Change to wget directory and run the classic command
+            $currentDir = Get-Location
+            Set-Location (Split-Path $Config.WgetPath -Parent)
             
-            Write-Log "Executing: wget $($wgetArgs -join ' ')"
-            
-            # Run wget and capture output for progress monitoring
-            $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-            $processInfo.FileName = $Config.WgetPath
-            $processInfo.Arguments = $wgetArgs -join " "
-            $processInfo.UseShellExecute = $false
-            $processInfo.RedirectStandardOutput = $true
-            $processInfo.RedirectStandardError = $true
-            $processInfo.CreateNoWindow = $true
-            
-            $process = New-Object System.Diagnostics.Process
-            $process.StartInfo = $processInfo
-            $process.Start() | Out-Null
-            
-            # Monitor wget progress
-            while (-not $process.HasExited) {
-                $output = $process.StandardOutput.ReadLine()
-                $error = $process.StandardError.ReadLine()
+            try {
+                # Classic wget command - simple and reliable
+                $process = Start-Process -FilePath ".\wget.exe" -ArgumentList $Config.MasterUrl -NoNewWindow -Wait -PassThru
                 
-                if ($output) {
-                    Write-Host $output -ForegroundColor Cyan
-                    # Parse progress if possible
-                    if ($output -match "(\d+)%") {
-                        $percent = [int]$matches[1]
-                        Show-Progress -Activity "Downloading Components" -Status "Downloaded $percent%" -PercentComplete $percent
+                # Return to original directory
+                Set-Location $currentDir
+                
+                if ($process.ExitCode -eq 0) {
+                    # wget downloaded to current directory, move it to target location
+                    $downloadedFile = Join-Path (Split-Path $Config.WgetPath -Parent) "master.zip"
+                    if (Test-Path $downloadedFile) {
+                        Move-Item $downloadedFile $Config.MasterZipPath -Force
+                        $fileSize = [math]::Round((Get-Item $Config.MasterZipPath).Length / 1MB, 2)
+                        Write-Log "Master.zip downloaded successfully with wget: $($Config.MasterZipPath) ($fileSize MB)" "SUCCESS"
+                    } else {
+                        Write-Log "Wget completed but file not found at expected location" "ERROR"
+                        return $false
                     }
+                } else {
+                    Set-Location $currentDir
+                    Write-Log "Wget download failed with exit code $($process.ExitCode)" "ERROR"
+                    return $false
                 }
-                
-                if ($error) {
-                    Write-Host $error -ForegroundColor Yellow
-                    # Also parse error stream for progress (wget outputs progress to stderr)
-                    if ($error -match "(\d+)%") {
-                        $percent = [int]$matches[1]
-                        Show-Progress -Activity "Downloading Components" -Status "Downloaded $percent%" -PercentComplete $percent
-                    }
-                }
-                
-                Start-Sleep -Milliseconds 100
             }
-            
-            $process.WaitForExit()
-            $exitCode = $process.ExitCode
-            $process.Dispose()
-            
-            if ($exitCode -eq 0 -and (Test-Path $Config.MasterZipPath)) {
-                $fileSize = [math]::Round((Get-Item $Config.MasterZipPath).Length / 1MB, 2)
-                Write-Log "Master.zip downloaded successfully with wget: $($Config.MasterZipPath) ($fileSize MB)" "SUCCESS"
-            } else {
-                Write-Log "Wget download failed with exit code $exitCode" "ERROR"
+            catch {
+                Set-Location $currentDir
+                Write-Log "Wget execution failed: $($_.Exception.Message)" "ERROR"
                 return $false
             }
         } else {
@@ -492,4 +461,987 @@ function Test-SSHConnection {
 function Install-NSSMService {
     try {
         Write-Log "Installing NSSM service for MiniDeb VM"
-        Show-Pr
+        Show-Progress -Activity "Installing Service" -Status "Configuring NSSM..." -PercentComplete 0
+        
+        $nssmExe = Join-Path $Config.NSSMPath "win64\nssm.exe"
+        if (-not (Test-Path $nssmExe)) {
+            $nssmExe = Join-Path $Config.NSSMPath "win32\nssm.exe"
+        }
+        
+        if (-not (Test-Path $nssmExe)) {
+            Write-Log "NSSM executable not found at expected locations" "ERROR"
+            return $false
+        }
+        
+        # Remove existing service if it exists
+        & $nssmExe stop $Config.ServiceName 2>$null
+        & $nssmExe remove $Config.ServiceName confirm 2>$null
+        
+        Show-Progress -Activity "Installing Service" -Status "Installing service..." -PercentComplete 25
+        
+        # Build QEMU command
+        $qemuExe = Join-Path $Config.QEMUPath "qemu-system-x86_64.exe"
+        $qemuArgs = @(
+            "-m", $Config.VMMemory,
+            "-smp", $Config.VMCPUs,
+            "-cdrom", "`"$($Config.ISOPath)`"",
+            "-netdev", "user,id=net0,hostfwd=tcp:127.0.0.1:$($Config.SSHPort)-:22,restrict=on",
+            "-device", "e1000,netdev=net0",
+            "-nographic",
+            "-serial", "file:`"$($Config.QEMULogFile)`"",
+            "-machine", "type=pc,accel=tcg"  # Use TCG (software) acceleration for maximum compatibility
+        ) -join " "
+        
+        # Install and configure service
+        $result = & $nssmExe install $Config.ServiceName "`"$qemuExe`""
+        if ($LASTEXITCODE -ne 0) {
+            Write-Log "Failed to install NSSM service" "ERROR"
+            return $false
+        }
+        
+        & $nssmExe set $Config.ServiceName Parameters $qemuArgs
+        & $nssmExe set $Config.ServiceName DisplayName "MiniDeb Virtual Machine"
+        & $nssmExe set $Config.ServiceName Description "Redneck WSL - Seamless Linux Integration"
+        & $nssmExe set $Config.ServiceName Start SERVICE_AUTO_START
+        & $nssmExe set $Config.ServiceName AppStdout "`"$($Config.QEMULogFile)`""
+        & $nssmExe set $Config.ServiceName AppStderr "`"$($Config.ErrorLogFile)`""
+        & $nssmExe set $Config.ServiceName AppRotateFiles 1
+        & $nssmExe set $Config.ServiceName AppRotateOnline 1
+        & $nssmExe set $Config.ServiceName AppRotateBytes 1048576  # 1MB
+        
+        Show-Progress -Activity "Installing Service" -Status "Complete" -PercentComplete 100
+        Write-Log "NSSM service installed successfully" "SUCCESS"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to install NSSM service: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+    finally {
+        if (-not $Quiet) {
+            Write-Progress -Activity "Installing Service" -Completed
+        }
+    }
+}
+
+# Enhanced CLI tools with SSH fallback
+function Install-CLITools {
+    Write-Log "Installing CLI tools"
+    
+    $sshAvailable = (Get-Command ssh.exe -ErrorAction SilentlyContinue) -ne $null
+    $sshCommand = if ($sshAvailable) { "ssh x@localhost -p $($Config.SSHPort)" } else { "echo SSH not available - use QEMU monitor or install SSH client" }
+    
+    $cliScript = @"
+@echo off
+setlocal enabledelayedexpansion
+
+rem MiniDeb CLI Tool - Redneck WSL Edition
+rem Usage: minideb [command]
+
+if "%1"=="" goto connect
+if /i "%1"=="connect" goto connect
+if /i "%1"=="start" goto start
+if /i "%1"=="stop" goto stop
+if /i "%1"=="restart" goto restart
+if /i "%1"=="status" goto status
+if /i "%1"=="logs" goto logs
+if /i "%1"=="help" goto help
+
+echo Unknown command: %1
+echo Use 'minideb help' for available commands.
+goto :eof
+
+:connect
+echo Connecting to MiniDeb Linux...
+$(if ($sshAvailable) { @"
+echo Use Ctrl+C to disconnect
+$sshCommand
+"@ } else { @"
+echo SSH client not available. Please install OpenSSH client or use direct VM access.
+echo You can install OpenSSH with: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+echo Or run the installer again without -SkipSSHInstall
+"@ })
+goto :eof
+
+:start
+echo Starting MiniDeb VM...
+net start "$($Config.ServiceName)" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo MiniDeb VM started successfully.
+    echo Waiting for VM to boot...$(if ($sshAvailable) { " and SSH to become available..." } else { "" })
+    
+    $(if ($sshAvailable) { @"
+    rem Wait for SSH to be ready
+    set /a attempts=0
+    :wait_ssh
+    ssh -o ConnectTimeout=1 -o BatchMode=yes -o StrictHostKeyChecking=no x@localhost -p $($Config.SSHPort) exit 2>nul
+    if !errorlevel! equ 0 (
+        echo MiniDeb is ready! Use 'minideb' to connect.
+        goto :eof
+    )
+    
+    set /a attempts+=1
+    if !attempts! lss 30 (
+        timeout /t 2 /nobreak >nul
+        goto :wait_ssh
+    )
+    
+    echo Warning: SSH not responding after 60 seconds. VM may still be booting.
+    echo Try 'minideb status' to check or wait a bit longer.
+"@ } else { @"
+    timeout /t 10 /nobreak >nul
+    echo MiniDeb VM should be booting. Check logs with 'minideb logs'
+"@ })
+) else (
+    echo Failed to start MiniDeb VM. Check 'minideb status' for details.
+)
+goto :eof
+
+:stop
+echo Stopping MiniDeb VM...
+net stop "$($Config.ServiceName)" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo MiniDeb VM stopped successfully.
+) else (
+    echo Failed to stop MiniDeb VM or it was already stopped.
+)
+goto :eof
+
+:restart
+echo Restarting MiniDeb VM...
+net stop "$($Config.ServiceName)" >nul 2>&1
+timeout /t 3 /nobreak >nul
+net start "$($Config.ServiceName)" >nul 2>&1
+if !errorlevel! equ 0 (
+    echo MiniDeb VM restarted successfully.
+    $(if ($sshAvailable) { @"
+    echo Waiting for SSH to become available...
+    
+    rem Wait for SSH to be ready
+    set /a attempts=0
+    :wait_ssh_restart
+    ssh -o ConnectTimeout=1 -o BatchMode=yes -o StrictHostKeyChecking=no x@localhost -p $($Config.SSHPort) exit 2>nul
+    if !errorlevel! equ 0 (
+        echo MiniDeb is ready! Use 'minideb' to connect.
+        goto :eof
+    )
+    
+    set /a attempts+=1
+    if !attempts! lss 30 (
+        timeout /t 2 /nobreak >nul
+        goto :wait_ssh_restart
+    )
+    
+    echo Warning: SSH not responding after 60 seconds. VM may still be booting.
+"@ } else { @"
+    echo VM restarted. Check status with 'minideb status' or logs with 'minideb logs'
+"@ })
+) else (
+    echo Failed to restart MiniDeb VM.
+)
+goto :eof
+
+:status
+echo MiniDeb VM Status:
+echo ==================
+sc query "$($Config.ServiceName)" | find "STATE" 2>nul
+if !errorlevel! equ 0 (
+    sc query "$($Config.ServiceName)" | find "RUNNING" >nul 2>&1
+    if !errorlevel! equ 0 (
+        echo Service Status: RUNNING
+        
+        $(if ($sshAvailable) { @"
+        rem Test SSH connectivity
+        ssh -o ConnectTimeout=2 -o BatchMode=yes -o StrictHostKeyChecking=no x@localhost -p $($Config.SSHPort) exit 2>nul
+        if !errorlevel! equ 0 (
+            echo SSH Status: ACCESSIBLE
+            echo Ready to use! Run 'minideb' to connect.
+        ) else (
+            echo SSH Status: NOT READY ^(VM may still be booting^)
+        )
+"@ } else { @"
+        echo SSH Status: NOT AVAILABLE ^(SSH client not installed^)
+        echo Note: Install OpenSSH client for full functionality
+"@ })
+    ) else (
+        echo Service Status: STOPPED
+        echo SSH Status: NOT AVAILABLE
+    )
+) else (
+    echo Service Status: NOT INSTALLED
+    echo Run the installer to set up MiniDeb.
+)
+echo.
+echo Installation Path: $($Config.InstallPath)
+echo SSH Port: $($Config.SSHPort)$(if (-not $sshAvailable) { " (SSH client not available)" } else { "" })
+goto :eof
+
+:logs
+echo Opening MiniDeb logs...
+if exist "$($Config.QEMULogFile)" (
+    echo QEMU Log:
+    echo =========
+    type "$($Config.QEMULogFile)"
+) else (
+    echo No QEMU log file found.
+)
+echo.
+if exist "$($Config.ErrorLogFile)" (
+    echo Error Log:
+    echo ==========
+    type "$($Config.ErrorLogFile)"
+) else (
+    echo No error log file found.
+)
+goto :eof
+
+:help
+echo MiniDeb - Redneck WSL Edition
+echo =============================
+echo Usage: minideb [command]
+echo.
+echo Commands:
+echo   minideb          Connect to Linux$(if (-not $sshAvailable) { " (requires SSH client)" } else { " via SSH (default)" })
+echo   minideb connect  Connect to Linux$(if (-not $sshAvailable) { " (requires SSH client)" } else { " via SSH" })
+echo   minideb start    Start the MiniDeb VM
+echo   minideb stop     Stop the MiniDeb VM
+echo   minideb restart  Restart the MiniDeb VM
+echo   minideb status   Show VM and SSH status
+echo   minideb logs     Show VM logs
+echo   minideb help     Show this help
+echo.
+echo Examples:
+echo   minideb                 # Connect to Linux
+echo   minideb start           # Start the VM
+echo   minideb status          # Check if everything is running
+echo.
+echo SSH Details:
+echo   Host: localhost
+echo   Port: $($Config.SSHPort)
+echo   User: x
+$(if (-not $sshAvailable) { @"
+echo.
+echo Note: SSH client not detected. To install:
+echo   Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0
+echo   Or re-run installer without -SkipSSHInstall
+"@ })
+echo.
+goto :eof
+"@
+
+    $cliPath = Join-Path $env:SystemRoot "System32\minideb.bat"
+    try {
+        Set-Content -Path $cliPath -Value $cliScript -Encoding ASCII
+        Write-Log "CLI tool installed successfully at $cliPath" "SUCCESS"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to install CLI tool: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+# System tray with dependency checking
+function Install-TrayApplication {
+    Write-Log "Installing system tray application"
+    
+    # Check if Windows Forms is available
+    try {
+        Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
+        Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+    }
+    catch {
+        Write-Log "Windows Forms not available. Skipping tray application." "WARN"
+        return $true  # Don't fail the entire installation
+    }
+    
+    $sshAvailable = (Get-Command ssh.exe -ErrorAction SilentlyContinue) -ne $null
+    
+    $trayScript = @"
+# MiniDeb System Tray Application
+# Redneck WSL Edition - Self-Contained
+
+# Check for required assemblies
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+}
+catch {
+    Write-Host "Windows Forms not available. Exiting tray application."
+    exit 1
+}
+
+# Configuration
+`$serviceName = "$($Config.ServiceName)"
+`$sshPort = $($Config.SSHPort)
+`$sshAvailable = `$(Get-Command ssh.exe -ErrorAction SilentlyContinue) -ne `$null
+
+# Create the form (hidden)
+`$form = New-Object System.Windows.Forms.Form
+`$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized
+`$form.ShowInTaskbar = `$false
+`$form.Visible = `$false
+
+# Create context menu
+`$contextMenu = New-Object System.Windows.Forms.ContextMenuStrip
+
+# Menu items
+if (`$sshAvailable) {
+    `$connectItem = `$contextMenu.Items.Add("Connect to Linux")
+    `$connectItem.Font = New-Object System.Drawing.Font(`$connectItem.Font, [System.Drawing.FontStyle]::Bold)
+    `$contextMenu.Items.Add("-")
+} else {
+    `$noSSHItem = `$contextMenu.Items.Add("SSH Not Available")
+    `$noSSHItem.Enabled = `$false
+    `$contextMenu.Items.Add("-")
+}
+
+`$startItem = `$contextMenu.Items.Add("Start MiniDeb")
+`$stopItem = `$contextMenu.Items.Add("Stop MiniDeb")
+`$restartItem = `$contextMenu.Items.Add("Restart MiniDeb")
+`$contextMenu.Items.Add("-")
+`$statusItem = `$contextMenu.Items.Add("Status")
+`$logsItem = `$contextMenu.Items.Add("View Logs")
+`$contextMenu.Items.Add("-")
+`$exitItem = `$contextMenu.Items.Add("Exit")
+
+# Create tray icon
+`$trayIcon = New-Object System.Windows.Forms.NotifyIcon
+`$trayIcon.ContextMenuStrip = `$contextMenu
+`$trayIcon.Visible = `$true
+
+# Load custom icon if available
+`$iconPath = "$($Config.IconPath)"
+if (Test-Path `$iconPath) {
+    try {
+        `$trayIcon.Icon = New-Object System.Drawing.Icon(`$iconPath)
+    }
+    catch {
+        `$trayIcon.Icon = [System.Drawing.SystemIcons]::Application
+    }
+} else {
+    `$trayIcon.Icon = [System.Drawing.SystemIcons]::Application
+}
+
+# Function to update tray icon status
+function Update-TrayIcon {
+    try {
+        `$service = Get-Service -Name `$serviceName -ErrorAction SilentlyContinue
+        if (`$service -and `$service.Status -eq "Running") {
+            if (`$sshAvailable) {
+                # Test SSH connectivity
+                `$tcpClient = New-Object System.Net.Sockets.TcpClient
+                try {
+                    `$result = `$tcpClient.BeginConnect("127.0.0.1", `$sshPort, `$null, `$null)
+                    `$success = `$result.AsyncWaitHandle.WaitOne(1000)
+                    `$tcpClient.Close()
+                    
+                    if (`$success) {
+                        `$trayIcon.Text = "MiniDeb - Running (SSH Ready)"
+                        `$startItem.Enabled = `$false
+                        `$stopItem.Enabled = `$true
+                        `$restartItem.Enabled = `$true
+                        if (`$connectItem) { `$connectItem.Enabled = `$true }
+                    } else {
+                        `$trayIcon.Text = "MiniDeb - Starting (SSH Not Ready)"
+                        `$startItem.Enabled = `$false
+                        `$stopItem.Enabled = `$true
+                        `$restartItem.Enabled = `$true
+                        if (`$connectItem) { `$connectItem.Enabled = `$false }
+                    }
+                }
+                catch {
+                    `$trayIcon.Text = "MiniDeb - Running (SSH Unknown)"
+                    `$startItem.Enabled = `$false
+                    `$stopItem.Enabled = `$true
+                    `$restartItem.Enabled = `$true
+                    if (`$connectItem) { `$connectItem.Enabled = `$false }
+                }
+            } else {
+                `$trayIcon.Text = "MiniDeb - Running (No SSH)"
+                `$startItem.Enabled = `$false
+                `$stopItem.Enabled = `$true
+                `$restartItem.Enabled = `$true
+            }
+        } else {
+            `$trayIcon.Text = "MiniDeb - Stopped"
+            `$startItem.Enabled = `$true
+            `$stopItem.Enabled = `$false
+            `$restartItem.Enabled = `$false
+            if (`$connectItem) { `$connectItem.Enabled = `$false }
+        }
+    }
+    catch {
+        `$trayIcon.Text = "MiniDeb - Error"
+        `$startItem.Enabled = `$true
+        `$stopItem.Enabled = `$true
+        `$restartItem.Enabled = `$true
+        if (`$connectItem) { `$connectItem.Enabled = `$false }
+    }
+}
+
+# Event handlers
+if (`$connectItem) {
+    `$connectItem.Add_Click({
+        if (`$sshAvailable) {
+            Start-Process -FilePath "cmd.exe" -ArgumentList "/c minideb connect"
+        }
+    })
+}
+
+`$startItem.Add_Click({
+    try {
+        Start-Service -Name `$serviceName
+        `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "Starting VM...", [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep 2
+        Update-TrayIcon
+    }
+    catch {
+        `$trayIcon.ShowBalloonTip(5000, "MiniDeb Error", "Failed to start VM: `$(`$_.Exception.Message)", [System.Windows.Forms.ToolTipIcon]::Error)
+    }
+})
+
+`$stopItem.Add_Click({
+    try {
+        Stop-Service -Name `$serviceName
+        `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "VM stopped", [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep 2
+        Update-TrayIcon
+    }
+    catch {
+        `$trayIcon.ShowBalloonTip(5000, "MiniDeb Error", "Failed to stop VM: `$(`$_.Exception.Message)", [System.Windows.Forms.ToolTipIcon]::Error)
+    }
+})
+
+`$restartItem.Add_Click({
+    try {
+        Stop-Service -Name `$serviceName
+        Start-Sleep 3
+        Start-Service -Name `$serviceName
+        `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "VM restarted", [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep 2
+        Update-TrayIcon
+    }
+    catch {
+        `$trayIcon.ShowBalloonTip(5000, "MiniDeb Error", "Failed to restart VM: `$(`$_.Exception.Message)", [System.Windows.Forms.ToolTipIcon]::Error)
+    }
+})
+
+`$statusItem.Add_Click({
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c minideb status & pause"
+})
+
+`$logsItem.Add_Click({
+    Start-Process -FilePath "cmd.exe" -ArgumentList "/c minideb logs & pause"
+})
+
+`$exitItem.Add_Click({
+    `$trayIcon.Visible = `$false
+    `$form.Close()
+    [System.Windows.Forms.Application]::Exit()
+})
+
+# Double-click behavior
+`$trayIcon.Add_DoubleClick({
+    if (`$sshAvailable -and `$connectItem -and `$connectItem.Enabled) {
+        Start-Process -FilePath "cmd.exe" -ArgumentList "/c minideb connect"
+    } else {
+        if (`$sshAvailable) {
+            `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "VM is not ready. Please wait or start it manually.", [System.Windows.Forms.ToolTipIcon]::Warning)
+        } else {
+            `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "SSH client not available. Install OpenSSH for full functionality.", [System.Windows.Forms.ToolTipIcon]::Warning)
+        }
+    }
+})
+
+# Update timer
+`$timer = New-Object System.Windows.Forms.Timer
+`$timer.Interval = 5000  # 5 seconds
+`$timer.Add_Tick({ Update-TrayIcon })
+`$timer.Start()
+
+# Initial update
+Update-TrayIcon
+
+# Show startup notification
+if (`$sshAvailable) {
+    `$trayIcon.ShowBalloonTip(3000, "MiniDeb", "Redneck WSL tray application started", [System.Windows.Forms.ToolTipIcon]::Info)
+} else {
+    `$trayIcon.ShowBalloonTip(5000, "MiniDeb", "Tray application started (SSH not available)", [System.Windows.Forms.ToolTipIcon]::Warning)
+}
+
+# Keep the application running
+`$form.Add_Load({ `$form.WindowState = [System.Windows.Forms.FormWindowState]::Minimized })
+[System.Windows.Forms.Application]::Run(`$form)
+"@
+
+    $trayPath = Join-Path $Config.InstallPath "minideb-tray.ps1"
+    try {
+        Set-Content -Path $trayPath -Value $trayScript -Encoding UTF8
+        
+        # Create startup shortcut
+        $startupPath = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup"
+        if (-not (Test-Path $startupPath)) {
+            New-Item -ItemType Directory -Path $startupPath -Force | Out-Null
+        }
+        
+        $startupScript = Join-Path $startupPath "MiniDeb-Tray.bat"
+        $startupContent = @"
+@echo off
+cd /d "$($Config.InstallPath)"
+powershell.exe -WindowStyle Hidden -ExecutionPolicy Bypass -File "$trayPath"
+"@
+        Set-Content -Path $startupScript -Value $startupContent -Encoding ASCII
+        
+        Write-Log "Tray application installed successfully" "SUCCESS"
+        return $true
+    }
+    catch {
+        Write-Log "Failed to install tray application: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+}
+
+# System requirements checking with dependency installation
+function Test-SystemRequirements {
+    Write-Log "Checking system requirements and dependencies"
+    
+    $issues = @()
+    
+    # Check PowerShell version
+    $psVersion = $PSVersionTable.PSVersion
+    if ($psVersion.Major -lt 3) {
+        $issues += "PowerShell version too old: $($psVersion.ToString()). Minimum: 3.0"
+    }
+    
+    # Check .NET Framework version
+    try {
+        $netVersion = [System.Environment]::Version
+        if ($netVersion.Major -lt 4) {
+            $issues += ".NET Framework version too old. Minimum: 4.0"
+        }
+    }
+    catch {
+        $issues += "Unable to determine .NET Framework version"
+    }
+    
+    # Check available RAM
+    $totalRAM = (Get-WmiObject -Class Win32_ComputerSystem).TotalPhysicalMemory / 1GB
+    if ($totalRAM -lt 3) {
+        $issues += "Low system RAM: $([math]::Round($totalRAM, 2))GB. Minimum: 3GB, Recommended: 4GB+"
+    }
+    
+    # Check available disk space
+    $installDrive = Split-Path $Config.InstallPath -Qualifier
+    $freeSpace = (Get-WmiObject -Class Win32_LogicalDisk | Where-Object { $_.DeviceID -eq $installDrive }).FreeSpace / 1GB
+    if ($freeSpace -lt 3) {
+        $issues += "Low disk space on $installDrive $([math]::Round($freeSpace, 2))GB free. Minimum: 3GB, Recommended: 5GB+"
+    }
+    
+    # Check Windows version
+    $winVersion = [System.Environment]::OSVersion.Version
+    if ($winVersion.Major -lt 6 -or ($winVersion.Major -eq 6 -and $winVersion.Minor -lt 1)) {
+        $issues += "Windows version too old: $($winVersion.ToString()). Minimum: Windows 7/2008 R2"
+    }
+    
+    # Check virtualization support
+    try {
+        $cpu = Get-WmiObject -Class Win32_Processor | Select-Object -First 1
+        if (-not $cpu.VirtualizationFirmwareEnabled) {
+            Write-Log "Hardware virtualization not enabled in BIOS. Performance will be slower." "WARN"
+        }
+    }
+    catch {
+        Write-Log "Unable to check virtualization support" "WARN"
+    }
+    
+    # Check Windows services
+    $requiredServices = @("BITS", "Winmgmt", "EventLog")
+    foreach ($service in $requiredServices) {
+        $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+        if (-not $svc -or $svc.Status -ne "Running") {
+            Write-Log "Required service '$service' not running" "WARN"
+        }
+    }
+    
+    if ($issues.Count -gt 0) {
+        Write-Log "System requirement issues found:" "WARN"
+        foreach ($issue in $issues) {
+            Write-Log "  - $issue" "WARN"
+        }
+        
+        # Check if issues are fatal
+        $fatalIssues = $issues | Where-Object { $_ -like "*too old*" -or $_ -like "*Minimum*" }
+        if ($fatalIssues.Count -gt 0) {
+            Write-Log "Fatal compatibility issues detected. Installation may fail." "ERROR"
+            return $false
+        } else {
+            Write-Log "Issues found but installation can continue with reduced functionality." "WARN"
+        }
+    } else {
+        Write-Log "System requirements check passed" "SUCCESS"
+    }
+    
+    return $true
+}
+
+# Enhanced uninstallation with better cleanup
+function Uninstall-MiniDeb {
+    Write-Log "Starting MiniDeb uninstallation" "INFO"
+    
+    $uninstallErrors = @()
+    
+    try {
+        # Stop and remove service
+        $nssmExe = $null
+        if (Test-Path (Join-Path $Config.NSSMPath "win64\nssm.exe")) {
+            $nssmExe = Join-Path $Config.NSSMPath "win64\nssm.exe"
+        } elseif (Test-Path (Join-Path $Config.NSSMPath "win32\nssm.exe")) {
+            $nssmExe = Join-Path $Config.NSSMPath "win32\nssm.exe"
+        }
+        
+        if ($nssmExe -and (Test-Path $nssmExe)) {
+            Write-Log "Stopping and removing NSSM service"
+            & $nssmExe stop $Config.ServiceName 2>$null
+            & $nssmExe remove $Config.ServiceName confirm 2>$null
+        } else {
+            # Fallback to sc.exe and net.exe
+            Write-Log "Using system tools to remove service"
+            net stop $Config.ServiceName 2>$null
+            sc.exe delete $Config.ServiceName 2>$null
+        }
+        
+        # Kill any remaining QEMU processes
+        Get-Process -Name "qemu-system-x86_64" -ErrorAction SilentlyContinue | Stop-Process -Force
+        
+        Write-Log "Service removed successfully" "SUCCESS"
+    }
+    catch {
+        $uninstallErrors += "Service removal: $($_.Exception.Message)"
+        Write-Log "Error removing service: $($_.Exception.Message)" "WARN"
+    }
+    
+    try {
+        # Remove CLI tools
+        $cliPath = Join-Path $env:SystemRoot "System32\minideb.bat"
+        if (Test-Path $cliPath) {
+            Remove-Item $cliPath -Force
+            Write-Log "CLI tool removed" "SUCCESS"
+        }
+    }
+    catch {
+        $uninstallErrors += "CLI tool removal: $($_.Exception.Message)"
+        Write-Log "Error removing CLI tool: $($_.Exception.Message)" "WARN"
+    }
+    
+    try {
+        # Remove startup entries
+        $startupPaths = @(
+            (Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\MiniDeb-Tray.bat"),
+            (Join-Path $env:ALLUSERSPROFILE "Microsoft\Windows\Start Menu\Programs\Startup\MiniDeb-Tray.bat")
+        )
+        
+        foreach ($startupPath in $startupPaths) {
+            if (Test-Path $startupPath) {
+                Remove-Item $startupPath -Force
+                Write-Log "Startup entry removed: $startupPath" "SUCCESS"
+            }
+        }
+    }
+    catch {
+        $uninstallErrors += "Startup entries removal: $($_.Exception.Message)"
+        Write-Log "Error removing startup entries: $($_.Exception.Message)" "WARN"
+    }
+    
+    try {
+        # Stop tray application processes
+        Get-Process -Name "powershell" | Where-Object { 
+            $_.CommandLine -and $_.CommandLine.Contains("minideb-tray.ps1") 
+        } | Stop-Process -Force -ErrorAction SilentlyContinue
+    }
+    catch {
+        Write-Log "Error stopping tray application: $($_.Exception.Message)" "WARN"
+    }
+    
+    try {
+        # Clean up PATH if we added OpenSSH
+        if (Test-Path $Config.SSHPath) {
+            $currentPath = [Environment]::GetEnvironmentVariable("PATH", "Machine")
+            if ($currentPath.Contains($Config.SSHPath)) {
+                $newPath = $currentPath.Replace(";$($Config.SSHPath)", "").Replace("$($Config.SSHPath);", "")
+                [Environment]::SetEnvironmentVariable("PATH", $newPath, "Machine")
+                Write-Log "Removed OpenSSH from PATH" "SUCCESS"
+            }
+        }
+    }
+    catch {
+        $uninstallErrors += "PATH cleanup: $($_.Exception.Message)"
+        Write-Log "Error cleaning PATH: $($_.Exception.Message)" "WARN"
+    }
+    
+    try {
+        # Remove installation directory (with retry)
+        if (Test-Path $Config.InstallPath) {
+            Write-Log "Removing installation directory: $($Config.InstallPath)"
+            
+            # First attempt
+            try {
+                Remove-Item $Config.InstallPath -Recurse -Force
+                Write-Log "Installation directory removed" "SUCCESS"
+            }
+            catch {
+                # Second attempt after a delay
+                Start-Sleep 2
+                Remove-Item $Config.InstallPath -Recurse -Force
+                Write-Log "Installation directory removed (second attempt)" "SUCCESS"
+            }
+        }
+    }
+    catch {
+        $uninstallErrors += "Directory removal: $($_.Exception.Message)"
+        Write-Log "Error removing installation directory: $($_.Exception.Message)" "WARN"
+        Write-Log "You may need to manually delete: $($Config.InstallPath)" "WARN"
+    }
+    
+    # Final status
+    if ($uninstallErrors.Count -eq 0) {
+        Write-Log "MiniDeb uninstallation completed successfully" "SUCCESS"
+        Write-Host "`nMiniDeb has been uninstalled successfully!" -ForegroundColor Green
+    } else {
+        Write-Log "MiniDeb uninstallation completed with errors" "WARN"
+        Write-Host "`nMiniDeb uninstallation completed with some errors:" -ForegroundColor Yellow
+        foreach ($error in $uninstallErrors) {
+            Write-Host "  - $error" -ForegroundColor Yellow
+        }
+    }
+    
+    Write-Host "You may need to reboot to complete the removal." -ForegroundColor Gray
+}
+
+# Main installation function with master.zip approach
+function Install-MiniDeb {
+    Write-Log "Starting MiniDeb installation - Redneck WSL Edition" "INFO"
+    
+    # Check system requirements first
+    if (-not (Test-SystemRequirements)) {
+        Write-Log "System requirements not met. Installation aborted." "ERROR"
+        return $false
+    }
+    
+    # Check internet connection
+    if (-not (Test-InternetConnection)) {
+        Write-Log "No internet connection detected. Cannot download required files." "ERROR"
+        Write-Host "Please check your internet connection and try again." -ForegroundColor Red
+        return $false
+    }
+    
+    # Create installation directory structure
+    try {
+        $directories = @($Config.InstallPath, $Config.ToolsPath)
+        foreach ($dir in $directories) {
+            if (-not (Test-Path $dir)) {
+                New-Item -ItemType Directory -Path $dir -Force | Out-Null
+                Write-Log "Created directory: $dir" "SUCCESS"
+            }
+        }
+    }
+    catch {
+        Write-Log "Failed to create installation directories: $($_.Exception.Message)" "ERROR"
+        return $false
+    }
+    
+    # Install wget first for fast downloads
+    Write-Log "Installing wget for fast downloads..."
+    if (-not (Install-Wget)) {
+        Write-Log "Failed to install wget - falling back to slower methods" "WARN"
+    }
+    
+    # Download and install all components from master.zip
+    if (-not (Install-MasterComponents)) {
+        Write-Log "Failed to install components from master.zip" "ERROR"
+        return $false
+    }
+    
+    # Setup SSH client
+    Ensure-SSHClient | Out-Null
+    
+    # Verify critical files exist
+    $qemuExe = Join-Path $Config.QEMUPath "qemu-system-x86_64.exe"
+    if (-not (Test-Path $qemuExe)) {
+        Write-Log "QEMU executable not found at: $qemuExe" "ERROR"
+        return $false
+    }
+    
+    if (-not (Test-Path $Config.ISOPath)) {
+        Write-Log "ISO file not found at: $($Config.ISOPath)" "ERROR"
+        return $false
+    }
+    
+    # Install components
+    $installSteps = @(
+        @{ Name = "NSSM Service"; Function = { Install-NSSMService } },
+        @{ Name = "CLI Tools"; Function = { Install-CLITools } },
+        @{ Name = "Tray Application"; Function = { Install-TrayApplication } }
+    )
+    
+    foreach ($step in $installSteps) {
+        Write-Log "Installing $($step.Name)..."
+        if (-not (& $step.Function)) {
+            Write-Log "Failed to install $($step.Name)" "ERROR"
+            return $false
+        }
+    }
+    
+    Write-Log "MiniDeb installation completed successfully!" "SUCCESS"
+    return $true
+}
+
+# Main execution with comprehensive error handling
+try {
+    Write-Host "MiniDeb Self-Contained Installer - Redneck WSL Edition" -ForegroundColor Cyan
+    Write-Host "======================================================" -ForegroundColor Cyan
+    Write-Host ""
+    
+    Write-Log "Installer started with parameters:" "INFO"
+    Write-Log "  Install Path: $($Config.InstallPath)" "INFO"
+    Write-Log "  SSH Port: $($Config.SSHPort)" "INFO"
+    Write-Log "  VM Name: $($Config.VMName)" "INFO"
+    Write-Log "  VM Memory: $($Config.VMMemory)MB" "INFO"
+    Write-Log "  VM CPUs: $($Config.VMCPUs)" "INFO"
+    Write-Log "  Skip SSH Install: $SkipSSHInstall" "INFO"
+    Write-Log "  PowerShell Version: $($PSVersionTable.PSVersion)" "INFO"
+    Write-Log "  Windows Version: $([System.Environment]::OSVersion.VersionString)" "INFO"
+    
+    if ($Uninstall) {
+        Write-Host "Starting uninstallation..." -ForegroundColor Yellow
+        Uninstall-MiniDeb
+    } else {
+        Write-Host "Starting installation..." -ForegroundColor Green
+        Write-Host "This installer is completely self-contained and will handle all dependencies." -ForegroundColor Gray
+        Write-Host ""
+        
+        if (Install-MiniDeb) {
+            Write-Host "`n" -NoNewline
+            Write-Host "Installation completed successfully!" -ForegroundColor Green
+            Write-Host ""
+            Write-Host "Quick Start Guide:" -ForegroundColor Cyan
+            Write-Host "=================" -ForegroundColor Cyan
+            Write-Host "1. Starting the VM: " -NoNewline; Write-Host "minideb start" -ForegroundColor Yellow
+            Write-Host "2. Connecting: " -NoNewline; Write-Host "minideb" -ForegroundColor Yellow
+            Write-Host "3. Check status: " -NoNewline; Write-Host "minideb status" -ForegroundColor Yellow
+            Write-Host "4. Stop VM: " -NoNewline; Write-Host "minideb stop" -ForegroundColor Yellow
+            Write-Host "5. Help: " -NoNewline; Write-Host "minideb help" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Features:" -ForegroundColor Cyan
+            Write-Host "- System tray icon shows VM status" -ForegroundColor White
+            Write-Host "- VM auto-starts with Windows" -ForegroundColor White
+            Write-Host "- SSH access on localhost:$($Config.SSHPort)" -ForegroundColor White
+            
+            $sshAvailable = (Get-Command ssh.exe -ErrorAction SilentlyContinue) -ne $null
+            if (-not $sshAvailable) {
+                Write-Host "- SSH client not available (limited functionality)" -ForegroundColor Yellow
+                Write-Host "  Run: Add-WindowsCapability -Online -Name OpenSSH.Client~~~~0.0.1.0" -ForegroundColor Gray
+            }
+            Write-Host ""
+            
+            # Start the service and tray app
+            Write-Host "Starting MiniDeb VM..." -ForegroundColor Yellow
+            try {
+                Start-Service -Name $Config.ServiceName
+                Write-Host "VM service started" -ForegroundColor Green
+                
+                # Start tray application
+                $trayPath = Join-Path $Config.InstallPath "minideb-tray.ps1"
+                Start-Process powershell.exe -ArgumentList "-WindowStyle Hidden -ExecutionPolicy Bypass -File `"$trayPath`"" -ErrorAction SilentlyContinue
+                Write-Host "Tray application started" -ForegroundColor Green
+                
+                Write-Host ""
+                if ($sshAvailable) {
+                    Write-Host "Waiting for SSH to become available..." -ForegroundColor Yellow
+                    if (Test-SSHConnection -TimeoutSeconds 60) {
+                        Write-Host "SSH is ready!" -ForegroundColor Green
+                        Write-Host ""
+                        Write-Host "You can now use " -NoNewline; Write-Host "minideb" -ForegroundColor Yellow -NoNewline; Write-Host " to connect to your Linux environment!"
+                    } else {
+                        Write-Host "SSH not ready yet. The VM may still be booting." -ForegroundColor Yellow
+                        Write-Host "Try " -NoNewline; Write-Host "minideb status" -ForegroundColor Yellow -NoNewline; Write-Host " in a few minutes."
+                    }
+                } else {
+                    Write-Host "VM started. Since SSH is not available, use " -NoNewline; Write-Host "minideb logs" -ForegroundColor Yellow -NoNewline; Write-Host " to monitor."
+                }
+            }
+            catch {
+                Write-Host "VM started but there may be issues. Check " -NoNewline -ForegroundColor Yellow
+                Write-Host "minideb status" -ForegroundColor Yellow -NoNewline
+                Write-Host " for details." -ForegroundColor Yellow
+            }
+            
+            Write-Host ""
+            Write-Host "Check the system tray for the MiniDeb icon!" -ForegroundColor Cyan
+            Write-Host ""
+            Write-Host "Dependencies Installed:" -ForegroundColor Gray
+            Write-Host "- NSSM (Service Manager): Success" -ForegroundColor Gray
+            Write-Host "- QEMU Portable: Success" -ForegroundColor Gray
+            Write-Host "- gLiTcH Linux ISO: Success" -ForegroundColor Gray
+            if ($sshAvailable) {
+                Write-Host "- SSH Client: Success" -ForegroundColor Gray
+            } else {
+                Write-Host "- SSH Client: Optional (not available)" -ForegroundColor Gray
+            }
+            
+        } else {
+            Write-Host "`nInstallation failed!" -ForegroundColor Red
+            Write-Host "Check the log file for details: $($Config.LogFile)" -ForegroundColor Yellow
+            Write-Host ""
+            Write-Host "Common issues on fresh Windows installs:" -ForegroundColor Yellow
+            Write-Host "- Execution policy restrictions (handled automatically)" -ForegroundColor Gray
+            Write-Host "- Missing .NET Framework (install from Microsoft)" -ForegroundColor Gray
+            Write-Host "- Network/firewall blocking downloads" -ForegroundColor Gray
+            Write-Host "- Insufficient disk space or permissions" -ForegroundColor Gray
+            exit 1
+        }
+    }
+}
+catch {
+    Write-Log "Unexpected error in main execution: $($_.Exception.Message)" "ERROR"
+    Write-Host "`nAn unexpected error occurred!" -ForegroundColor Red
+    Write-Host "Error: $($_.Exception.Message)" -ForegroundColor Yellow
+    Write-Host "Check the log file: $($Config.LogFile)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host "If this is a fresh Windows install, you may need:" -ForegroundColor Yellow
+    Write-Host "- .NET Framework 4.0+ (usually included in Windows 10/11)" -ForegroundColor Gray
+    Write-Host "- PowerShell 3.0+ (included in Windows 8+)" -ForegroundColor Gray
+    Write-Host "- Administrator privileges (script should auto-elevate)" -ForegroundColor Gray
+    exit 1
+}
+
+Write-Log "MiniDeb installer finished" "INFO"
+Write-Host ""
+Write-Host "Installation log saved to: $($Config.LogFile)" -ForegroundColor Gray
+
+# Display final system information
+Write-Host ""
+Write-Host "System Information:" -ForegroundColor Gray
+Write-Host "==================" -ForegroundColor Gray
+Write-Host "Windows Version: $([System.Environment]::OSVersion.VersionString)" -ForegroundColor Gray
+Write-Host "PowerShell Version: $($PSVersionTable.PSVersion)" -ForegroundColor Gray
+Write-Host ".NET Framework: $([System.Environment]::Version)" -ForegroundColor Gray
+Write-Host "Architecture: $($env:PROCESSOR_ARCHITECTURE)" -ForegroundColor Gray
+Write-Host "Install Path: $($Config.InstallPath)" -ForegroundColor Gray
+
+if (-not $Uninstall) {
+    Write-Host ""
+    Write-Host "Next Steps:" -ForegroundColor Cyan
+    Write-Host "1. Wait 30-60 seconds for the VM to fully boot" -ForegroundColor White
+    Write-Host "2. Check the system tray for the MiniDeb icon" -ForegroundColor White  
+    Write-Host "3. Run 'minideb status' to verify everything is working" -ForegroundColor White
+    Write-Host "4. Run 'minideb' to connect to your Linux environment" -ForegroundColor White
+    Write-Host ""
+    Write-Host "Troubleshooting:" -ForegroundColor Yellow
+    Write-Host "- If SSH fails: Run 'minideb logs' to see boot messages" -ForegroundColor White
+    Write-Host "- If VM won't start: Check Windows Event Viewer" -ForegroundColor White
+    Write-Host "- For help: Run 'minideb help'" -ForegroundColor White
+}
+
+Write-Host ""
+Write-Host "Installation complete! Success!" -ForegroundColor Green
